@@ -1,18 +1,48 @@
-"""Рисуем графики для ноутбука о жилых домах Красноярска."""
+"""Загрузка данных и графики о жилых домах Красноярска."""
 
+from pathlib import Path
 from textwrap import fill
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 
 floors = 'Этажность'
 stop = 'Ближайшая остановка, м'
 address = 'Адрес дома'
 coordinates = 'Координаты'
+target = 'Тип жильца'
+district = 'Район'
+court = 'Закрытый двор'
+air = 'Загрязнение воздуха, % (модель)'
+profile_distances = ['Школа, м', 'Детский сад, м', stop, 'Развлечения, м', 'Аптека, м', 'Больница, м']
 blue, teal, amber, ink, grid = '#2964A3', '#087E77', '#BE5B2B', '#172D45', '#DFE7EF'
+class_colors = {
+    'Семейная': blue, 'Для одного человека': teal,
+    'Для пожилых людей': '#7764A5', 'Для автомобилиста': amber,
+}
+
+
+def load_data():
+    path = Path(__file__).with_name('датасет.xlsx')
+    raw = pd.read_excel(path, sheet_name='Данные', keep_default_na=False)
+    data = raw.replace(r'^\s*(?:информация отсутствует)?\s*$', np.nan, regex=True)
+    numeric = [col for col in raw if col.endswith(', м')] + [floors, air]
+    data[numeric] = data[numeric].apply(pd.to_numeric, errors='coerce')
+    data[court] = np.nan  # Сведения об ограждениях отсутствуют по методике источника.
+    if data[target].isna().any() or not data[target].isin(class_colors).all():
+        raise ValueError('Столбец «Тип жильца» содержит пропуски или неизвестные классы.')
+    return raw, data
+
+
+def read_coordinates(data):
+    geo = data[coordinates].str.split(',', n=1, expand=True).apply(pd.to_numeric, errors='coerce')
+    geo.columns = ['Широта', 'Долгота']
+    valid = geo['Широта'].between(-90, 90) & geo['Долгота'].between(-180, 180)
+    return geo.loc[valid]
 
 
 def style(fig, height):
@@ -120,9 +150,64 @@ def box(ax, col, *, data):
     ax.grid(axis='x', color=grid)
 
 
-def district_bar(dashboard, values, title, color, row, col, *, showlegend=True, fmt=',.0f'):
-    dashboard.add_trace(go.Bar(
-        x=values, y=values.index, orientation='h', name=title,
-        marker_color=color, showlegend=showlegend,
-        hovertemplate=f'%{{y}}<br>{title}: %{{x:{fmt}}}<extra></extra>',
-    ), row, col)
+def profile_dashboard(data, geo):
+    counts = data[target].value_counts().reindex(class_colors)
+    medians = data.groupby(target)[profile_distances].median().reindex(counts.index)
+    covered = data[district].value_counts().loc[lambda n: n >= 30].index
+    district_counts = pd.crosstab(data[district], data[target]).reindex(
+        index=covered, columns=counts.index, fill_value=0,
+    )
+    shares = district_counts.div(district_counts.sum(axis=1), axis=0)
+    points = data.join(geo, how='inner')
+
+    fig = make_subplots(
+        rows=3, cols=2, row_heights=[.33, .39, .28],
+        specs=[[{}, {}], [{}, {}], [{'type': 'table', 'colspan': 2}, None]],
+        horizontal_spacing=.18, vertical_spacing=.115,
+        subplot_titles=['Размер классов', 'Доли классов по районам',
+                        'Дома по координатам', 'Расстояние до остановки',
+                        'Типичные расстояния по классам, м'],
+    )
+    fig.add_trace(go.Bar(
+        x=counts, y=counts.index, orientation='h', marker_color=list(class_colors.values()),
+        showlegend=False, hovertemplate='%{y}<br>%{x:,} записей<extra></extra>',
+    ), 1, 1)
+    for label, color in class_colors.items():
+        fig.add_trace(go.Bar(
+            x=shares[label], y=shares.index, orientation='h', name=label,
+            marker_color=color, customdata=district_counts[label], legendgroup=label,
+            hovertemplate='%{y}<br>%{x:.1%} (%{customdata:,} записей)',
+        ), 1, 2)
+        group = points.loc[points[target].eq(label)]
+        fig.add_trace(go.Scatter(
+            x=group['Долгота'], y=group['Широта'], text=group[address],
+            mode='markers', marker=dict(size=4, opacity=.65, color=color),
+            name=label, legendgroup=label, showlegend=False,
+            hovertemplate='%{text}<extra>%{fullData.name}</extra>',
+        ), 2, 1)
+        fig.add_trace(go.Box(
+            x=data.loc[data[target].eq(label), stop], y0=label, orientation='h',
+            name=label, marker_color=color, legendgroup=label, showlegend=False, boxpoints=False,
+        ), 2, 2)
+
+    fig.add_vline(x=4200, line_dash='dot', line_color=amber,
+                  annotation_text='Порог 4 200 м', row=2, col=2)
+    table = medians.rename(columns={stop: 'Остановка, м'}).map(lambda value: f'{value:g}').reset_index()
+    fig.add_trace(go.Table(
+        columnwidth=[1.65, 1, 1, 1, 1, 1, 1],
+        header=dict(values=list(table), fill_color=ink, font=dict(color='white'), height=29, align='left'),
+        cells=dict(values=table.T.to_numpy().tolist(), fill_color=['#EFF5FB'], height=26, align='left'),
+    ), 3, 1)
+
+    fig.update_xaxes(title='Записей', row=1, col=1)
+    fig.update_xaxes(tickformat='.0%', range=[0, 1], row=1, col=2)
+    fig.update_xaxes(title='Долгота, °', row=2, col=1)
+    fig.update_yaxes(title='Широта, °', row=2, col=1)
+    fig.update_xaxes(title='Расстояние по прямой, м', row=2, col=2)
+    for row, col in [(1, 1), (1, 2), (2, 2)]:
+        fig.update_yaxes(autorange='reversed', row=row, col=col)
+    return style(fig, 835).update_layout(
+        title=dict(text='Тип жильца и доступность инфраструктуры в Красноярске', y=.975, yanchor='top'),
+        barmode='stack', margin=dict(l=145, r=40, t=132, b=42),
+        legend=dict(orientation='h', y=1.055, yanchor='bottom'),
+    )
